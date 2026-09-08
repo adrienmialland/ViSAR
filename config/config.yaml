@@ -1,0 +1,19 @@
+
+dataset:
+  name: MMLongBench
+  qas_data: samples.json
+  qas_data_results: samples_results.json
+
+retrieval:
+  encoder: colpali-v1.2 # colpali-v1.2, colqwen2.5-v0.1, colmodernvbert
+  mode: ViSAR # ViSAR, LateInteraction, LargestGap, ScoreCluster
+  max_k: 5
+
+generator:
+  name: Qwen2.5-VL-7B-Instruct # Qwen3-VL-8B-Instruct, Qwen2.5-VL-7B-Instruct, InternVL3_5-8B-Instruct, Idefics3-8B-Llama3, llava-onevision-qwen2-7b
+
+sweep: # can only sweep over retrieval config. Dataset and generator config are used as declared.
+  retrieval:
+    encoder: [colpali-v1.2, colqwen2.5-v0.1, colmodernvbert] # [colpali-v1.2, colqwen2.5-v0.1, colmodernvbert]
+    mode: [ViSAR, LateInteraction] # [ViSAR, LateInteraction, LargestGap, ScoreCluster]
+    max_k: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
