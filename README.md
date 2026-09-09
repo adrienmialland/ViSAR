@@ -57,7 +57,7 @@ Document page retrieval mechanisms. (a) Late-interaction fixed top-k. (b) The pr
 
 ## How to Run
 
-- Update `./config/config.yaml` for the desired configuration.
+- Update the `./config/config.yaml` file for the desired configuration.
 
 - Run ViSAR:
 
@@ -85,7 +85,7 @@ Document page retrieval mechanisms. (a) Late-interaction fixed top-k. (b) The pr
 
 The `--sweep` option allows sweeping across multiple *retrieval* configurations:
 
-- Update the sweep section in `./config/config.yaml`.
+- Update the sweep section in the `./config/config.yaml` file.
 
 - Run ViSAR across configurations:
 
@@ -105,9 +105,9 @@ If you use this code, please cite:
 
 ```text
 @article{Mialland2026ViSAR,
-  title={ViSAR: Training-Free Adaptive-k Retrieval for Visual Document Question Answering},
-  author={Mialland, Adrien and Marc, Plantevit and Julien, Gallois and Céline, Robardet},
-  journal={arXiv preprint},
+  title={ViSAR: Training-Free Adaptive-$ k $ Retrieval for Visual Document Question Answering},
+  author={Mialland, Adrien and Plantevit, Marc and Gallois, Julien and Robardet, C{\'e}line},
+  journal={arXiv preprint arXiv:2609.02486},
   year={2026}
 }
 ```
