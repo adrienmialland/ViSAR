@@ -136,6 +136,26 @@ def bootstrap_ci(labels, n_boot=10000, ci=95, seed=0):
     half_width = (upper - lower) / 2
     return se, half_width, lower, upper
 
+def paired_bootstrap_ci(correct_a, correct_b, n_boot=10000, alpha=0.05, seed=0):
+    """Return (delta, lo, hi) in points for mean(a) - mean(b), resampling queries jointly."""
+    a, b = np.asarray(correct_a, float), np.asarray(correct_b, float)
+    rng = np.random.default_rng(seed)
+    n = len(a)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    deltas = (a[idx].mean(1) - b[idx].mean(1)) * 100
+    lower, upper = np.percentile(deltas, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return (a.mean() - b.mean()) * 100, lower, upper
+
+def bootstrap_mean_ci(d, n_boot=10_000, seed=0, alpha=0.05, chunk=1000):
+    rng = np.random.default_rng(seed)
+    d = np.asarray(d, float)
+    means = np.concatenate([
+        d[rng.integers(0, len(d), size=(chunk, len(d)))].mean(axis=1)
+        for _ in range(n_boot // chunk)
+    ])
+    return 100*d.mean(), 100*np.quantile(means, alpha/2), 100*np.quantile(means, 1-alpha/2)   
+
+
 @dataclass
 class EvalState():
     mode: str
@@ -265,7 +285,7 @@ class SensitivityAnalyser():
                 ]
                 ndcg_at_10_lateinteraction.append(metrics_at_10_lateinteraction[0])
                 recall_at_10_lateinteraction.append(metrics_at_10_lateinteraction[1])
-                
+
             mean_ndcg_at_5_visar = np.mean(ndcg_at_5_visar, axis=0) - np.mean(ndcg_at_5_lateinteraction)
             mean_ndcg_at_10_visar = np.mean(ndcg_at_10_visar, axis=0) - np.mean(ndcg_at_10_lateinteraction)
 
@@ -427,6 +447,7 @@ class ViSARSelectorAblation(ViSARSelector):
         selector = HeuristicsSelector()
 
         ablations = [
+            (False, False, None, 'latency_no_budget'),
             (True, False, None, 'w_i'), (False, True, None, 'w_p'), (True, True, None, 'w_i_w_p'), 
             (False, False, 'LargestGap', 'k_star_LargestGap'), (False, False, 'ScoreCluster', 'k_star_ScoreCluster')
         ]
@@ -439,7 +460,7 @@ class ViSARSelectorAblation(ViSARSelector):
             to_ablate = [a for a in ablations if a[3] not in sample['Ablation']]
 
             for disable_w_i, disable_w_p, heuristic, ablation_id in to_ablate:
-                if ablation_id in ['w_i', 'w_p', 'w_i_w_p']:
+                if ablation_id in ['latency_no_budget', 'w_i', 'w_p', 'w_i_w_p']:
                     encoder.from_pretrained()
                     
                     embed_query = encoder.encode_query(sample['question'])
@@ -453,13 +474,16 @@ class ViSARSelectorAblation(ViSARSelector):
                         embed_query[0], embed_pages
                     )
 
-                    ev_pages = self.dataset.get_evidence_pages(sample)
-                    metrics_at_5  = compute_ranking_metrics(ev_pages, ranking['indexes'][:5 ])
-                    metrics_at_10 = compute_ranking_metrics(ev_pages, ranking['indexes'][:10])
+                    if ablation_id == 'latency_no_budget':
+                        sample['Ablation'][ablation_id] = ranking['latency']
+                    else:
+                        ev_pages = self.dataset.get_evidence_pages(sample)
+                        metrics_at_5  = compute_ranking_metrics(ev_pages, ranking['indexes'][:5 ])
+                        metrics_at_10 = compute_ranking_metrics(ev_pages, ranking['indexes'][:10])
 
-                    sample['Ablation'][ablation_id] = [
-                        metrics_at_5['NDCG'], metrics_at_10['NDCG'], metrics_at_5['Recall'], metrics_at_10['Recall']
-                    ]
+                        sample['Ablation'][ablation_id] = [
+                            metrics_at_5['NDCG'], metrics_at_10['NDCG'], metrics_at_5['Recall'], metrics_at_10['Recall']
+                        ]
                 else:
                     scores = sample['ViSAR'][encoder_name]['scores']
 
@@ -512,7 +536,7 @@ class ViSARSelectorAblation(ViSARSelector):
 
         self.dataset.save_results(self.data)
 
-    def results_ablation_study(self, encoder_name: str, LVLM_name: str):
+    def results_ablation_on_ranking_and_retrieval(self, encoder_name: str, LVLM_name: str):
         metrics_no_abla = []
         metrics_w_i = []
         metrics_w_p = []
@@ -526,9 +550,7 @@ class ViSARSelectorAblation(ViSARSelector):
 
         gen_id = LVLM_name + f'__max_{self.max_k}'
 
-        data = self.dataset.load_data(from_results=True)
-
-        for sample in data:
+        for sample in self.data:
             ev_pages = self.dataset.get_evidence_pages(sample)
             
             ViSAR_indexes = sample['ViSAR'][encoder_name]['indexes']
@@ -571,106 +593,166 @@ class ViSARSelectorAblation(ViSARSelector):
         headers = ['variant', 'Mean k*', f'Accuracy with Max-{self.max_k} budget']
         print(tabulate(tabular_gen_ablation, headers=headers, tablefmt="github"))
 
+    def result_ablation_budget_latency(self, encoder_name: str, LVLM_name: str):
+        colors = {
+            'LateInteraction': 'seagreen',
+            'ViSAR': 'darkorange',
+            'Ablation': 'crimson'
+        }
+        markers = {
+            'LateInteraction': '.',
+            'ViSAR': '^',
+            'Ablation': '.'            
+        }
+
+        if self.dataset.name == 'MMLongBench':
+            bins = [1, 51, 101, 151, 201, 500]
+        else:
+            bins = [50, 76, 101, 126, 151]
+
+        k = max([int(k.split('_')[-1]) for k in self.data[0]['ViSAR'][encoder_name] if k.startswith(LVLM_name)])
+
+        latencies: dict[str, dict[str, list]] = {}
+        
+        for mode in ['LateInteraction', 'ViSAR', 'Ablation']:
+            latencies[mode] = {}
+            means, stds, xticks = [], [], []
+
+            for start, end in zip(bins[:-1], bins[1:]):
+                bin = f"{start}-{end-1}"
+                if bin not in latencies:
+                    latencies[mode][bin] = []
+
+                values = []
+                for sample in self.data:
+                    ViSAR_indexes = sample['ViSAR'][encoder_name]['indexes']
+                    if len(ViSAR_indexes) == 0:
+                        continue
+                    
+                    n_pages = len(sample['LateInteraction'][encoder_name]['indexes'])
+                    if n_pages < start or n_pages >= end:
+                        continue
+
+                    if mode == 'Ablation':
+                        latency = sample[mode]['latency_no_budget']
+                    elif mode == 'LateInteraction':
+                        latency = sample[mode][encoder_name]['latency']
+                    else:
+                        latency = sample[mode][encoder_name][f'latency__max_{k}']
+
+                    latencies[mode][bin].append(latency['total'])
+        
+        tabular_latencies = []
+        for mode in latencies:
+            values = latencies[mode].values()
+            mean_bins = [round(np.mean(v), 3) for v in values]
+            std_bins = [round(np.std(v), 3) for v in values]
+            xticks = [bin for bin in latencies[mode]]
+
+            plt.plot(xticks, mean_bins, marker=markers[mode], linewidth=1, label=mode, color=colors[mode])
+            plt.fill_between(
+                xticks, 
+                [m - s for m, s in zip(mean_bins, std_bins)], 
+                [m + s for m, s in zip(mean_bins, std_bins)], 
+                color=colors[mode], alpha=0.15
+            )
+
+            mean_all = round(np.mean([vv for v in values for vv in v]), 3)
+            tabular_latencies.append([mode] + [mean_all] + mean_bins)
+
+        headers = ['mode'] + ['All'] + [bin for bin in latencies['Ablation']]
+        print(tabulate(tabular_latencies, headers=headers, tablefmt="github"))
+
+        plt.xticks(fontsize=7)
+        plt.xlabel("# Document pages")
+        plt.ylabel("Latency (s)")
+        plt.title('Budget Ablation: Retrieval Latency')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        to_save = f"{self.dataset.results_dir}/{encoder_name}/ablation_budget_latency.svg"
+        plt.savefig(to_save, dpi=300)
+        print(f'- figure saved: {to_save}')
+        plt.close()
+
 class LatencyEvaluator():
     def __init__(self, dataset: DatasetEval):
         self.dataset = dataset
         self.data = self.dataset.load_data(from_results=True)
 
-    def run_ViSAR_Approx_latencies(self, encoder_names: list[str]):
+    def run_ViSAR_latencies(self, encoder_names: list[str], LVLM_name: str):
         from models.encoders import get_encoder
+        ViSAR = ViSARSelector()  
 
-        approx_params = [(450, None, None), (None, 75, None), (None, None, 10), (450, 75, None), (450, None, 10), (None, 75, 10), (450, 75, 10)]
-        get_id = lambda j, p, s: 'latency' + (f'_top_j_{j}' if j else '') + (f'_top_p_{p}' if p else '') + (f'_top_s_{s}' if s else '')
-
-        ViSAR = ViSARSelector()        
-
-        print('\n### Evaluation of ViSAR-Approx latency :')
+        print('\n### Evaluation of ViSAR latency :')
         for encoder_name in encoder_names:
             encoder = get_encoder(encoder_name)
 
             print(f'\n# using {encoder_name}\n')
-            for sample in tqdm(self.data, desc=f'Latency Approx '):
-                if 'ViSAR_Approx' not in sample:
-                    sample['ViSAR_Approx'] = {}
-                if encoder.name not in sample['ViSAR_Approx']:
-                    sample['ViSAR_Approx'][encoder.name] = {}
+            for sample in tqdm(self.data, desc=f'Latency ViSAR '):
+                max_ks = [int(key.split('_')[-1]) for key in sample['ViSAR'][encoder.name] if key.startswith(LVLM_name)]
+                if 15 not in max_ks: max_ks.append(15)
+                if 20 not in max_ks: max_ks.append(20)
 
-                params = [(j, p, s) for j, p, s in approx_params if get_id(j, p, s) not in sample['ViSAR_Approx'][encoder.name]]
-
-                for j, p, s in params:
+                for max_k in max_ks:
+                    if f'latency__max_{max_k}' in sample['ViSAR'][encoder.name]:
+                        continue
                     encoder.from_pretrained()
                     
                     embed_query = encoder.encode_query(sample['question'])
                     embed_pages = encoder.load_embed_pages(sample['doc_id'], self.dataset.embedding_dir)
 
                     ranking = ViSAR.score_pages_and_find_k_star(
-                        embed_query[0], embed_pages, top_j=j, top_p=p, top_s=s
+                        embed_query[0], embed_pages, top_s=max_k
                     )
 
-                    sample['ViSAR_Approx'][encoder.name][get_id(j, p, s)] = ranking['latency']
+                    sample['ViSAR'][encoder.name][f'latency__max_{max_k}'] = ranking['latency']
 
                     self.dataset.new_data = True
                 self.dataset.save_results(self.data, 60)
+            
             encoder.empty_memory()
         self.dataset.save_results(self.data)
 
     def results_latency_ViSAR_vs_lateinteraction(self, encoder_names: list[str], LVLM_name):
-        full_approx = 'latency_top_j_450_top_p_75_top_s_10'
         for encoder_name in encoder_names:
             n_pages = []
-            latency_retrieval = {
-                "LateInteraction": [],
-                "ViSAR": {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                "ViSAR_Approx": {
-                    'latency_top_j_450': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_p_75': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_s_10': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_j_450_top_p_75': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_j_450_top_s_10': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_p_75_top_s_10': {"weights": [], "sim_mat": [], "ranking": [], "total": []},
-                    'latency_top_j_450_top_p_75_top_s_10': {"weights": [], "sim_mat": [], "ranking": [], "total": []}
-                }
-            }
-            latency_generation = {"LateInteraction": [], "ViSAR": [], "ViSAR_Approx": []}
-            latency_end_to_end = {"LateInteraction": [], "ViSAR": [], "ViSAR_Approx": []}
+            latency_retrieval  = {"LateInteraction": [], "ViSAR": None}
+            latency_generation = {"LateInteraction": [], "ViSAR": []}
+            latency_end_to_end = {"LateInteraction": [], "ViSAR": []}
 
             for sample in self.data:
                 n_pages.append(len(sample['LateInteraction'][encoder_name]['indexes']))
-
-                latency_retrieval['LateInteraction'].append(sample['LateInteraction'][encoder_name]['latency']['total'])
-                for componant, latency in sample['ViSAR'][encoder_name]['latency'].items():
-                    latency_retrieval['ViSAR'][componant].append(latency)
-                for k, approx_value in sample['ViSAR_Approx'][encoder_name].items():
-                    if k.startswith('latency'):                        
-                        for componant, latency in approx_value.items():
-                            latency_retrieval['ViSAR_Approx'][k][componant].append(latency)
-
+                max_ks = [int(key.split('_')[-1]) for key in sample['ViSAR'][encoder_name] if key.startswith(LVLM_name)]
+                if latency_retrieval['ViSAR'] is None:
+                    latency_retrieval['ViSAR'] = {
+                        k: {"weights": [], "sim_mat": [], "ranking": [], "total": []} for k in max_ks
+                    }
                 gen_ids_sorted = sorted(
                     [k for k in sample['ViSAR'][encoder_name].keys() if k.startswith(LVLM_name)],
                     key=lambda id: int(id.split('_')[-1])
-                )
+                )                    
+
+                latency_retrieval['LateInteraction'].append(sample['LateInteraction'][encoder_name]['latency']['total'])
+
+                for k in max_ks:
+                    for componant, latency in sample['ViSAR'][encoder_name][f'latency__max_{k}'].items():
+                        latency_retrieval['ViSAR'][k][componant].append(latency)
 
                 if latency_generation['ViSAR'] == []:
                     for _ in range(len(gen_ids_sorted)):
                         latency_generation['ViSAR'].append([])
-                        latency_end_to_end['ViSAR'].append([])
-                        latency_generation['ViSAR_Approx'].append([])
-                        latency_end_to_end['ViSAR_Approx'].append([])                        
+                        latency_end_to_end['ViSAR'].append([])                      
                         latency_generation['LateInteraction'].append([])
                         latency_end_to_end['LateInteraction'].append([])
 
                 for i, gen_id in enumerate(gen_ids_sorted):
+                    k = int(gen_id.split('_')[-1])
+                    latency_ret_visar = latency_retrieval['ViSAR'][k]['total'][-1]
                     latency_gen_visar = sample['ViSAR'][encoder_name][gen_id]['latency']
                     latency_gen_latei = sample['LateInteraction'][encoder_name][gen_id]['latency']
                     
                     latency_generation['ViSAR'][i].append(latency_gen_visar)
-                    latency_end_to_end['ViSAR'][i].append(latency_retrieval['ViSAR']['total'][-1] + latency_gen_visar)
-
-                    # assuming ViSAR-Approx parameters: top_j, top_p, and top_s are set so that no
-                    # loss in retrieval performances is observed, then ViSAR-Approx uses ViSAR 
-                    # generation latency for end-to-end, as input set of image are the same (see main paper).
-                    latency_generation['ViSAR_Approx'][i].append(latency_gen_visar)
-                    latency_end_to_end['ViSAR_Approx'][i].append(latency_retrieval['ViSAR_Approx'][full_approx]['total'][-1] + latency_gen_visar)
+                    latency_end_to_end['ViSAR'][i].append(latency_ret_visar + latency_gen_visar)
 
                     latency_generation['LateInteraction'][i].append(latency_gen_latei)
                     latency_end_to_end['LateInteraction'][i].append(latency_retrieval['LateInteraction'][-1] + latency_gen_latei)
@@ -682,57 +764,79 @@ class LatencyEvaluator():
             else:
                 bins = [50, 76, 101, 126, 151]
 
-            print('\n### Retrieval latency: ViSAR vs Late-Interaction vs ViSAR-Approx.')
-            for latency_to_plot in [['Late-Interaction', 'ViSAR'], ['Late-Interaction', 'ViSAR', 'ViSAR-Approx.']]:
-                for latency, label, color in [
-                    (latency_retrieval['LateInteraction']                    , 'Late-Interaction', 'seagreen'  ),
-                    (latency_retrieval['ViSAR']['total' ]                    , 'ViSAR'           , 'darkorange'),
-                    (latency_retrieval['ViSAR_Approx'][full_approx]['total' ], 'ViSAR-Approx.'   , 'crimson'   )
-                ]:
-                    if label not in latency_to_plot:
+            print('\n### Retrieval latency: ViSAR vs Late-Interaction')
+            for latency, label, color, linestyle, marker in [
+                (latency_retrieval['LateInteraction']            , 'Late-Interaction', 'seagreen'  , 'solid' , '.'),
+                (latency_retrieval['ViSAR'][max(max_ks)]['total'], 'ViSAR'           , 'darkorange', 'solid', '^'), # max(max_ks) to report the upper bound retrieval latency
+                (latency_retrieval['ViSAR'][min(max_ks)]['total'], 'ViSAR'           , 'darkorange', 'solid', '*')  # min(max_ks) to report the lower bound retrieval latency
+            ]:
+                means, counts, stds, xticks = [], [], [], []
+
+                for start, end in zip(bins[:-1], bins[1:]):
+                    idx = [i for i, n in enumerate(n_pages) if start <= n < end]
+
+                    if len(idx) == 0:
                         continue
 
-                    means, counts, stds, xticks = [], [], [], []
+                    values = [latency[i] for i in idx]
 
-                    for start, end in zip(bins[:-1], bins[1:]):
-                        idx = [i for i, n in enumerate(n_pages) if start <= n < end]
+                    means.append(np.mean(values))
+                    counts.append(len(idx))
+                    stds.append(np.std(values))
+                    xticks.append(f"{start}-{end-1}\n(n={len(idx)})")
 
-                        if len(idx) == 0:
-                            continue
+                plt.plot(xticks, means, marker=marker, linewidth=1, linestyle=linestyle, label=label, color=color)
+                plt.fill_between(xticks, [m - s for m, s in zip(means, stds)], [m + s for m, s in zip(means, stds)], color=color, alpha=0.15)                
+            
+            plt.xticks(fontsize=7)
+            plt.xlabel("# Document pages")
+            plt.ylabel("Latency (s)")
+            plt.title('Retrieval Latency')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval.svg"
+            plt.savefig(to_save, dpi=300)
+            print(f'- figure saved: {to_save}')
+            plt.close()
 
-                        values = [latency[i] for i in idx]
-
-                        means.append(np.mean(values))
-                        counts.append(len(idx))
-                        stds.append(np.std(values))
-                        xticks.append(f"{start}-{end-1}\n(n={len(idx)})")
-
-                    plt.plot(xticks, means, marker=".", linewidth=1, label=label, color=color)
-                    plt.fill_between(xticks, [m - s for m, s in zip(means, stds)], [m + s for m, s in zip(means, stds)], color=color, alpha=0.15)                
+            print('\n### Generation latency: ViSAR vs Late-Interaction')
+            for mode_latencies, label, color in [
+                (latency_generation['LateInteraction'], 'Late-Interaction' , 'seagreen'  ),
+                (latency_generation['ViSAR']          , 'ViSAR'            , 'darkorange')
+            ]:
+                means, stds = [], []
+                for latencies in mode_latencies:
+                    means.append(np.mean(latencies))
+                    stds.append(np.std(latencies))
                 
-                plt.xticks(fontsize=7)
-                plt.xlabel("# Document pages")
-                plt.ylabel("Latency (s)")
-                plt.title('Retrieval Latency')
-                plt.grid(True, alpha=0.3)
-                plt.legend()
-                if 'ViSAR-Approx.' not in latency_to_plot:
-                    to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval.svg"
-                else:
-                    to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval_ViSAR-Approx.svg"
-                plt.savefig(to_save, dpi=300)
-                print(f'- figure saved: {to_save}')
-                plt.close()
+                plt.plot(list(range(1, len(means) + 1)), means, marker=".", linewidth=1, label=label, color=color)
+                plt.fill_between(list(range(1, len(means) + 1)), [m - s for m, s in zip(means, stds)], [m + s for m, s in zip(means, stds)], alpha=0.15, color=color)
 
-            print('\n### Generation latency: ViSAR vs Late-Interaction vs ViSAR-Approx.')
-            for latency_to_plot in [['Late-Interaction', 'ViSAR'], ['Late-Interaction', 'ViSAR', 'ViSAR-Approx.']]:
+            plt.xticks(fontsize=7)
+            plt.xlabel("Max_k retrieved pages")
+            plt.ylabel("Latency (s)")
+            plt.title('Generation Latency')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_generation.svg"
+            plt.savefig(to_save, dpi=300)
+            print(f'- figure saved: {to_save}')        
+            plt.close()
+
+            if self.dataset.name == 'MMLongBench':
+                document_sizes = [(1, float('inf'), 'All'), (100, 150, '100-150'), (151, 200, '151-200'), (201, float('inf'), '468')]
+            else:
+                document_sizes = [(1, float('inf'), 'All'), (75, 100, '75-100'), (100, 125, '100-125'), (125, 150, '125-150')]
+
+            print('\n### End-to-end latency: ViSAR vs Late-Interaction')
+            tabular_latencies = []
+            for mn, mx, s_name in document_sizes:
                 for mode_latencies, label, color in [
-                    (latency_generation['LateInteraction'], 'Late-Interaction' , 'seagreen'  ),
-                    (latency_generation['ViSAR']          , 'ViSAR'            , 'darkorange'),
-                    (latency_generation['ViSAR_Approx']   , 'ViSAR-Approx.'    , 'crimson'   )
+                    (latency_end_to_end['LateInteraction'], 'Late-Interaction' , 'seagreen'  ),
+                    (latency_end_to_end['ViSAR']          , 'ViSAR'            , 'darkorange')
                 ]:
-                    if label not in latency_to_plot:
-                        continue
+                    mask = (n_pages > mn) & (n_pages <= mx)
+                    mode_latencies = [np.array(latencies)[mask] for latencies in mode_latencies]
 
                     means, stds = [], []
                     for latencies in mode_latencies:
@@ -745,71 +849,25 @@ class LatencyEvaluator():
                 plt.xticks(fontsize=7)
                 plt.xlabel("Max_k retrieved pages")
                 plt.ylabel("Latency (s)")
-                plt.title('Generation Latency')
+                plt.title(f'End-to-end Latency - Queries on {s_name} pages docs')
                 plt.grid(True, alpha=0.3)
                 plt.legend()
-                if 'ViSAR-Approx.' not in latency_to_plot:            
-                    to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_generation.svg"
-                else:
-                    to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_generation_ViSAR-Approx.svg"
+                to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_end-to-end_{s_name}_pages.svg"
                 plt.savefig(to_save, dpi=300)
-                print(f'- figure saved: {to_save}')        
+                print(f'- figure saved: {to_save}')
                 plt.close()
 
-            if self.dataset.name == 'MMLongBench':
-                document_sizes = [(1, float('inf'), 'All'), (100, 150, '100-150'), (151, 200, '151-200'), (201, float('inf'), '468')]
-            else:
-                document_sizes = [(1, float('inf'), 'All'), (75, 100, '75-100'), (100, 125, '100-125'), (125, 150, '125-150')]
-
-            print('\n### End-to-end latency: ViSAR vs Late-Interaction vs ViSAR-Approx.')
-            for latency_to_plot in [['Late-Interaction', 'ViSAR'], ['Late-Interaction', 'ViSAR', 'ViSAR-Approx.']]:
-                for mn, mx, s_name in document_sizes:
-                    for mode_latencies, label, color in [
-                        (latency_end_to_end['LateInteraction'], 'Late-Interaction' , 'seagreen'  ),
-                        (latency_end_to_end['ViSAR']          , 'ViSAR'            , 'darkorange'),
-                        (latency_end_to_end['ViSAR_Approx']   , 'ViSAR-Approx.'    , 'crimson')
-                    ]:
-                        if label not in latency_to_plot:
-                            continue
-
-                        mask = (n_pages > mn) & (n_pages <= mx)
-                        mode_latencies = [np.array(latencies)[mask] for latencies in mode_latencies]
-
-                        means, stds = [], []
-                        for latencies in mode_latencies:
-                            means.append(np.mean(latencies))
-                            stds.append(np.std(latencies))
-                        
-                        plt.plot(list(range(1, len(means) + 1)), means, marker=".", linewidth=1, label=label, color=color)
-                        plt.fill_between(list(range(1, len(means) + 1)), [m - s for m, s in zip(means, stds)], [m + s for m, s in zip(means, stds)], alpha=0.15, color=color)
-
-                    plt.xticks(fontsize=7)
-                    plt.xlabel("Max_k retrieved pages")
-                    plt.ylabel("Latency (s)")
-                    plt.title(f'End-to-end Latency - Queries on {s_name} pages docs')
-                    plt.grid(True, alpha=0.3)
-                    plt.legend()
-                    if 'ViSAR-Approx.' not in latency_to_plot:         
-                        to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_end-to-end_{s_name}_pages.svg"
-                    else:
-                        to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_end-to-end_ViSAR-Approx_{s_name}_pages.svg"
-                    plt.savefig(to_save, dpi=300)
-                    print(f'- figure saved: {to_save}')        
-                    plt.close()
+            headers = ['n_pages', 'mode'] + [f'Max-{k+1}' for k in range(len(latency_end_to_end['ViSAR']))]
+            print(tabulate(tabular_latencies, headers=headers, tablefmt="github"))
 
             plt.figure(figsize=(10, 4))
-            print('\n### Retrieval latency: ViSAR componants vs ViSAR-Approx componants.')
-            for latencies, componant, color, plot_idx in [
-                [latency_retrieval['ViSAR']['weights']  , 'weights', 'darkgray'  , 1],
-                [latency_retrieval['ViSAR']['sim_mat']  , 'sim_mat', 'darkorange', 1],
-                [latency_retrieval['ViSAR']['ranking']  , 'ranking', 'orchid'    , 1],
-                [latency_retrieval['ViSAR']['total'  ]  , 'total'  , 'crimson'   , 1],
-                [latency_retrieval['ViSAR_Approx'][full_approx]['weights'], 'weights', 'darkgray'  , 2],
-                [latency_retrieval['ViSAR_Approx'][full_approx]['sim_mat'], 'sim_mat', 'darkorange', 2],
-                [latency_retrieval['ViSAR_Approx'][full_approx]['ranking'], 'ranking', 'orchid'    , 2],
-                [latency_retrieval['ViSAR_Approx'][full_approx]['total'  ], 'total'  , 'crimson'   , 2]
+            print('\n### Retrieval latency: ViSAR componants')
+            for latencies, componant, color in [
+                [latency_retrieval['ViSAR'][max(max_ks)]['weights']  , 'weights', 'darkgray'  ],
+                [latency_retrieval['ViSAR'][max(max_ks)]['sim_mat']  , 'sim_mat', 'darkorange'],
+                [latency_retrieval['ViSAR'][max(max_ks)]['ranking']  , 'ranking', 'orchid'    ],
+                [latency_retrieval['ViSAR'][max(max_ks)]['total'  ]  , 'total'  , 'crimson'   ]
             ]:
-                plt.subplot(1, 2, plot_idx)
                 means, counts, stds, xticks = [], [], [], []
 
                 for start, end in zip(bins[:-1], bins[1:]):
@@ -834,52 +892,9 @@ class LatencyEvaluator():
                 plt.grid(True, alpha=0.3)
                 plt.legend()
 
-            to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval_by_componants_ViSAR_vs_ViSAR-Approx.svg"
+            to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval_by_ViSAR_componants.svg"
             plt.savefig(to_save, dpi=300)
             print(f'- figure saved: {to_save}')    
-            plt.close()
-
-            print('\n### Retrieval latency: ViSAR-Approx strategies.')
-            for latencies, label, color, linestyle, zorder in [
-                (latency_retrieval['LateInteraction']                                             , 'Late-Interaction' , 'seagreen'     , 'solid',  3),
-                (latency_retrieval['ViSAR']['total']                                              , 'ViSAR        '    , 'darkorange'   , 'solid',  6),
-                (latency_retrieval['ViSAR_Approx']['latency_top_p_75']['total']                   , 'max_p'            , 'steelblue'    , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_s_10']['total']                   , 'max_k'            , 'cadetblue'    , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_j_450']['total']                  , 'top_j'            , 'lightskyblue' , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_p_75_top_s_10']['total']          , 'max_p, max_k'     , 'orange'       , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_j_450_top_p_75']['total']         , 'top_j, max_p'     , 'darkgray'     , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_j_450_top_s_10']['total']         , 'top_j, max_k'     , 'orchid'       , 'dashed', 0),
-                (latency_retrieval['ViSAR_Approx']['latency_top_j_450_top_p_75_top_s_10']['total'], 'ViSAR-Approx.'    , 'crimson'      , 'solid', 10)
-            ]:
-                means, counts, stds, xticks = [], [], [], []
-
-                for start, end in zip(bins[:-1], bins[1:]):
-                    idx = [i for i, n in enumerate(n_pages) if start <= n < end]
-
-                    if len(idx) == 0:
-                        continue
-
-                    values = [latencies[i] for i in idx]
-
-                    means.append(np.mean(values))
-                    counts.append(len(idx))
-                    stds.append(np.std(values))
-                    xticks.append(f"{start}-{end-1}\n(n={len(idx)})")
-
-                    linewidth = 0.6 if linestyle == 'dashed' else 1
-                    alpha = 0.8 if linestyle == 'dashed' else 1
-                
-                plt.plot(xticks, means, marker=".", linewidth=linewidth, label=label, color=color, linestyle=linestyle, alpha=alpha, zorder=zorder)
-                # plt.fill_between(xticks, [m - s for m, s in zip(means, stds)], [m + s for m, s in zip(means, stds)], color=color, alpha=0.1)
-            
-            plt.xticks(fontsize=7)
-            plt.xlabel("Number of pages")
-            plt.ylabel("Latency (s)")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            to_save = f"{self.dataset.results_dir}/{encoder_name}/latency_retrieval_by_ViSAR-Approx_strategies.svg"
-            plt.savefig(to_save, dpi=300)
-            print(f'- figure saved: {to_save}')
             plt.close()
 
     def results_latency_ViSAR_vs_heuristics(self, encoder_names: list[str], max_ks: list[int], LVLM_name: str):
@@ -900,27 +915,26 @@ class LatencyEvaluator():
                 mean_gen_latency.append([mode])
                 mean_ete_latency.append([mode])
 
-                ret_latency = [sample[mode][encoder_name]['latency']['total'] for sample in self.data]
-                mean_ret_latency[-1].append(round(np.mean(ret_latency), 3))
-
                 for k in max_ks_:
+                    latency_key = f'latency__max_{k}' if mode == 'ViSAR' else 'latency'
+                    ret_latency = [sample[mode][encoder_name][latency_key]['total'] for sample in self.data]
+                    mean_ret_latency[-1].append(round(np.mean(ret_latency), 3))
+
                     gen_latency = [sample[mode][encoder_name][f'{LVLM_name}__max_{k}']['latency'] for sample in self.data]
                     mean_gen_latency[-1].append(round(np.mean(gen_latency), 3))
                     mean_ete_latency[-1].append(round(mean_ret_latency[-1][-1] + mean_gen_latency[-1][-1], 3))
 
-            print(f'# Using {encoder_name} and {LVLM_name}')
-
-            headers = ['modes', 'Latency']
-            print(tabulate(mean_ret_latency, headers=headers, tablefmt="github"))
 
             mean_gen_latency = [[''] + l for l in mean_gen_latency]
             mean_gen_latency[0][0] = 'Generation'
             mean_ete_latency = [[''] + l for l in mean_ete_latency]
             mean_ete_latency[0][0] = 'End_to_end'
-
             mean_latencies = mean_gen_latency + [[]] + mean_ete_latency
 
             headers = ['modes'] + [f'Latency at Max-{k}' for k in max_ks_]
+
+            print(f'# Using {encoder_name} and {LVLM_name}')
+            print(tabulate(mean_ret_latency, headers=headers, tablefmt="github"))
             print(tabulate(mean_latencies, headers=headers, tablefmt="github"), '\n')
 
 class AdaptiveRetrievalEvaluator():
@@ -1313,9 +1327,15 @@ class AccuracyEvaluator():
         
         return False
 
-    def result_answer_generation_accuracy(self, encoder_names: list[str], LVLM_name: str, max_ks: list[int]):
+    def result_answer_generation_perconfig_accuracy(self, encoder_names: list[str], LVLM_name: str, max_ks: list[int]):
         tabular_acc = []
         tabular_p_values = []
+
+        manuscript_max_ks = [5, 10]
+        if manuscript_max_ks[0] in max_ks and manuscript_max_ks[1] in max_ks:
+            max_ks_ = manuscript_max_ks
+        else:
+            max_ks_ = max_ks
 
         print('\n### Accuracy results - ViSAR vs Late-Interaction vs Heuristics :')
         for mode in ['LateInteraction', 'LargestGap', 'ScoreCluster']:
@@ -1327,7 +1347,7 @@ class AccuracyEvaluator():
                 [LVLM_name, mode   ]
             ]
             for encoder_name in encoder_names:
-                for k in max_ks:
+                for k in max_ks_:
                     gen_id = LVLM_name + f'__max_{k}'
                     Vi_are_correct, LI_are_correct = [], []
 
@@ -1345,19 +1365,19 @@ class AccuracyEvaluator():
                         round(100 * v, 2) for v in bootstrap_ci(LI_are_correct)
                     ]
                     tabular_acc[-2].append(
-                        str(round(100 * np.mean(LI_are_correct), 2)) + f'  ({lower}-{upper})'
+                        str(round(100 * np.mean(LI_are_correct), 2)) + f'  ({lower}/{upper})'
                     )
 
                     se, hw, lower, upper = [
                         round(100 * v, 2) for v in bootstrap_ci(Vi_are_correct)
                     ]
                     tabular_acc[-1].append(
-                        str(round(100 * np.mean(Vi_are_correct), 2)) + f'  ({lower}-{upper})'
+                        str(round(100 * np.mean(Vi_are_correct), 2)) + f'  ({lower}/{upper})'
                     )
 
                     tabular_p_values[-1].append(round(get_McNemar_p_value(LI_are_correct, Vi_are_correct), 3))
 
-        encoder_at_k = [e + f'@{k}' for e in encoder_names for k in max_ks]
+        encoder_at_k = [e + f'@{k}' for e in encoder_names for k in max_ks_]
 
         print('# Mean accuracies with 95% confidence intervals in parentheses :')
         headers = ['models', 'mode'] + encoder_at_k
@@ -1365,6 +1385,216 @@ class AccuracyEvaluator():
         print('# Mean accuracies difference p-values (McNemar\'s test) :')
         headers = ['models', 'mode'] + encoder_at_k
         print(tabulate(tabular_p_values, headers=headers, tablefmt="github"))
+
+    def result_answer_generation_pareto_plot(self, encoder_names: list[str], LVLM_name: str, max_ks: list[int]):
+        print('\n### Accuracy results - Accuracy vs num_pages of ViSAR and Late-Interaction:')
+
+        tabular_num_pages = []
+        for encoder_name in encoder_names:
+            for mode, label, color in [
+                    ('LateInteraction', 'Late-Interaction', 'seagreen'),
+                    ('LargestGap'     , 'LargestGap'      , 'xkcd:vivid purple'),
+                    ('ScoreCluster'   , 'ScoreCluster'    , 'xkcd:golden rod'),
+                    ('ViSAR'          , 'ViSAR'           , 'darkorange')
+                ]:
+                xs, means = [], []
+
+                tabular_num_pages.append([encoder_name, mode] if mode == 'LateInteraction' else ['', mode])
+
+                for k in max_ks:
+                    gen_id = LVLM_name + f'__max_{k}'
+                    num_pages, are_correct = [], []
+
+                    for sample in self.data:
+                        # avoid corrupted samples from ColModernVBERT
+                        base_indexes = sample['LateInteraction'][encoder_name]['indexes']
+                        ViSAR_indexes = sample['ViSAR'][encoder_name]['indexes']
+                        if ViSAR_indexes == [] or base_indexes == []:
+                            continue
+
+                        num_pages.append(min(k, sample[mode][encoder_name].get('k_star', float('inf'))))
+                        are_correct.append(sample[mode][encoder_name][gen_id]['correctness'])
+
+                    xs.append(np.mean(num_pages))
+                    means.append(100 * np.mean(are_correct))
+
+                    tabular_num_pages[-1].append(round(xs[-1], 1))
+
+                plt.plot(xs, means, marker=".", linewidth=1, label=label, color=color)
+
+            plt.xticks(list(range(1, len(xs) + 1)), fontsize=7)
+            plt.xlabel("Average number of retrieved pages")
+            plt.ylabel("Accuracy (%)")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            to_save = f"{self.dataset.results_dir}/{encoder_name}/accuracy_vs_numpages.svg"
+            plt.savefig(to_save, dpi=300)
+            print(f'- figure saved: {to_save}')
+            plt.close()
+
+        print('# Average number of pages for a given Max-k budget')
+        headers = ['encoder', 'mode', *[f'Max-{k}' for k in max_ks]]
+        print(tabulate(tabular_num_pages, headers=headers, tablefmt="github"))
+
+    def result_answer_generation_forest_plot(self, encoder_names: list[str], LVLM_name: str, max_ks: list[int]):
+        print('\n### Accuracy differences results. Adaptive-k methods against fixed top-k:')
+
+        colors = {
+            'LargestGap': 'xkcd:vivid purple',
+            'ScoreCluster': 'xkcd:golden rod',
+            'ViSAR': 'darkorange'
+        }
+
+        manuscript_max_ks = [5, 10]
+        if manuscript_max_ks[0] in max_ks and manuscript_max_ks[1] in max_ks:
+            max_ks_ = manuscript_max_ks
+        else:
+            max_ks_ = max_ks
+
+        y, yticks, ynames = 0, [], []
+        tabular_differences = []
+        for encoder_name in encoder_names:
+            for mode in ['ViSAR', 'LargestGap', 'ScoreCluster']:
+                tabular_differences.append([LVLM_name, encoder_name, mode])
+                for k in max_ks_:
+                    gen_id = LVLM_name + f'__max_{k}'
+                    adapt_are_correct = []
+                    fixed_are_correct = []
+
+                    for sample in self.data:
+                        # avoid corrupted samples from ColModernVBERT
+                        base_indexes = sample[mode][encoder_name]['indexes']
+                        ViSAR_indexes = sample['ViSAR'][encoder_name]['indexes']
+                        if ViSAR_indexes == [] or base_indexes == []:
+                            continue
+
+                        fixed_are_correct.append(sample['LateInteraction'][encoder_name][gen_id]['correctness'])
+                        adapt_are_correct.append(sample[mode][encoder_name][gen_id]['correctness'])
+
+                    diff, lower, upper = paired_bootstrap_ci(adapt_are_correct, fixed_are_correct)
+
+                    tabular_differences[-1].append(f'{round(diff, 2)} ({round(lower, 2)}/{round(upper, 2)})')
+
+                    yticks.append(y)
+                    ynames.append(f'{mode} - {encoder_name}')
+                    plt.plot(
+                        [lower, upper], [y, y], color=colors[mode], 
+                        linestyle = 'solid' if k == 5 else 'dashed',
+                        label = str(k) if mode == 'ViSAR' and encoder_name == encoder_names[0] else None
+                    )
+                    plt.plot(diff, y, "o", color=colors[mode])
+
+                    y += 1
+            y += 1.5
+
+            plt.axvline(0, color='seagreen', lw=1)
+            plt.yticks(yticks, ynames)
+
+        plt.xlim(-3.9, 3.9)
+        plt.grid(True, alpha=0.3, axis="x")
+        plt.xlabel("$\\Delta$ Accuracy: Adaptive-$k$ − Fixed top-$k$")
+        plt.legend()
+        plt.tight_layout()
+        to_save = f"{self.dataset.results_dir}/adaptive_k_and_fixed_k_diffs.svg"
+        plt.savefig(to_save, dpi=300)
+        print(f'- figure saved: {to_save}')
+        plt.close()
+
+        print('\n# Mean differences in accuracies with 95% confidence intervals in parentheses :')
+        headers = ['models', 'encoder', 'mode'] + max_ks_
+        print(tabulate(tabular_differences, headers=headers, tablefmt="github"))
+
+    def result_answer_generation_forest_plot_all(self, encoder_names, max_ks):
+        colors = {
+            'LargestGap': 'xkcd:vivid purple',
+            'ScoreCluster': 'xkcd:golden rod',
+            'ViSAR': 'darkorange'
+        }
+
+        manuscript_max_ks = [5, 10]
+        if manuscript_max_ks[0] in max_ks and manuscript_max_ks[1] in max_ks:
+            max_ks_ = manuscript_max_ks
+        else:
+            max_ks_ = max_ks
+
+        names = [
+            'llava-onevision-qwen2-7b', 'Idefics3-8B-Llama3', 
+            'InternVL3_5-8B-Instruct', 'Qwen3-VL-8B-Instruct'
+        ]
+        sample_0 = self.data[0]['ViSAR'][encoder_names[0]]
+        LVLM_names = [name for name in names if all(f'{name}__max_{k}' in sample_0 for k in max_ks_)]
+
+        for k in max_ks_:
+            pooled_diffs = {m: [] for m in colors}
+            y, yticks, ynames = 0, [], []
+
+            for LVLM_name in LVLM_names:
+                for encoder_name in encoder_names:
+                    for mode in ['ViSAR', 'LargestGap', 'ScoreCluster']:
+                        gen_id = LVLM_name + f'__max_{k}'
+                        adapt_are_correct = []
+                        fixed_are_correct = []
+
+                        for sample in self.data:
+                            # avoid corrupted samples from ColModernVBERT
+                            base_indexes = sample[mode][encoder_name]['indexes']
+                            ViSAR_indexes = sample['ViSAR'][encoder_name]['indexes']
+                            if ViSAR_indexes == [] or base_indexes == []:
+                                continue
+
+                            fixed_are_correct.append(sample['LateInteraction'][encoder_name][gen_id]['correctness'])
+                            adapt_are_correct.append(sample[mode][encoder_name][gen_id]['correctness'])
+
+                        diff, lower, upper = paired_bootstrap_ci(adapt_are_correct, fixed_are_correct)
+
+                        pooled_diffs[mode].append(np.asarray(adapt_are_correct, float) - np.asarray(fixed_are_correct, float))
+
+                        yticks.append(y)
+                        ynames.append(f'{LVLM_name.split('-')[0]} - {mode[:5]} - {encoder_name[:4]}')
+                        plt.plot(
+                            [lower, upper], [y, y], color=colors[mode], 
+                            linestyle = 'solid' if k == 5 else 'dashed', lw=1.2,
+                            label = str(k) if mode == 'ViSAR' and encoder_name == encoder_names[0] else None
+                        )
+                        plt.plot(diff, y, "o", color=colors[mode], markersize=4)
+
+                        y += 1
+                    y += 1.5
+
+            transpose = {m: [] for m in colors}
+            for mode in ['ViSAR', 'LargestGap', 'ScoreCluster']:
+                for j in range(max([len(p) for p in pooled_diffs[mode]])):
+                    transpose[mode].append([])
+                    for i in range(len(pooled_diffs[mode])):
+                        if j < len(pooled_diffs[mode][i]):
+                            transpose[mode][-1].append(pooled_diffs[mode][i][j])
+                per_query = [np.mean(t) for t in transpose[mode]]
+                # per_query = np.mean(transpose[mode], axis=1)
+                p_diff, p_lower, p_upper = bootstrap_mean_ci(per_query)
+                plt.plot(
+                    [p_lower, p_upper], [y, y], color=colors[mode], 
+                    linestyle = 'solid' if k == 5 else 'dashed', lw=1.2,
+                    label = str(k) if mode == 'ViSAR' and encoder_name == encoder_names[0] else None
+                )
+                plt.plot(p_diff, y, "o", color=colors[mode], markersize=4)
+                y += 1            
+
+            plt.axvline(0, color='seagreen', lw=1)
+            plt.yticks(yticks, ynames)
+
+            ROW_H = 0.11
+            plt.gcf().set_size_inches(7, ROW_H * (y + 2))
+            plt.ylim(-1, y)            
+
+            plt.xlim(-5, 15)
+            plt.grid(True, alpha=0.3, axis="x")
+            plt.xlabel("$\\Delta$ Accuracy: Adaptive-$k$ − Fixed top-$k$")
+            # plt.legend()
+            plt.tight_layout()
+            to_save = f"{self.dataset.results_dir}/all_adaptive_k_and_fixed_{k}_diffs.svg"
+            plt.savefig(to_save, dpi=300)
+            print(f'- figure saved: {to_save}')
+            plt.close()
 
     def results_accuracy_vs_similarity_matrix_sparsity(self, encoder_names: list[str], max_ks: list[int], LVLM_name: str):
         colors = {
@@ -1494,7 +1724,6 @@ def main(config, sweep, retrieval, generation, latency, sensitivity, ablation):
 
     if generation:
         accuracy_evaluator = AccuracyEvaluator(dataset)
-
         print('\n### Evaluation of generated answers across configurations :')
         for conf in config_set.configs:
             state = EvalState(
@@ -1503,13 +1732,15 @@ def main(config, sweep, retrieval, generation, latency, sensitivity, ablation):
                 gen_id=conf.generator.gen_id
             )
             accuracy_evaluator.run_answer_evaluation(state)
-
-        accuracy_evaluator.result_answer_generation_accuracy(encoder_names, current_LVLM, max_ks)
+        accuracy_evaluator.result_answer_generation_perconfig_accuracy(encoder_names, current_LVLM, max_ks)
+        accuracy_evaluator.result_answer_generation_pareto_plot(encoder_names, main_LVLM, max_ks)
+        accuracy_evaluator.result_answer_generation_forest_plot(encoder_names, current_LVLM, max_ks)
+        accuracy_evaluator.result_answer_generation_forest_plot_all(encoder_names, max_ks)
         accuracy_evaluator.results_accuracy_vs_similarity_matrix_sparsity(encoder_names, max_ks, main_LVLM)
 
     if latency:
         latency_evaluator = LatencyEvaluator(dataset)
-        latency_evaluator.run_ViSAR_Approx_latencies(encoder_names)
+        latency_evaluator.run_ViSAR_latencies(encoder_names, main_LVLM)
         latency_evaluator.results_latency_ViSAR_vs_lateinteraction(encoder_names, main_LVLM)
         latency_evaluator.results_latency_ViSAR_vs_heuristics(encoder_names, max_ks, main_LVLM)
 
@@ -1523,7 +1754,8 @@ def main(config, sweep, retrieval, generation, latency, sensitivity, ablation):
         visar_ablation = ViSARSelectorAblation(dataset)
         visar_ablation.run_retrieval_ablation('colpali-v1.2')
         visar_ablation.run_generation_from_ablated_retrieval('colpali-v1.2', main_LVLM)
-        visar_ablation.results_ablation_study('colpali-v1.2', main_LVLM)
+        visar_ablation.results_ablation_on_ranking_and_retrieval('colpali-v1.2', main_LVLM)
+        visar_ablation.result_ablation_budget_latency('colpali-v1.2', main_LVLM)
 
 if __name__ == "__main__":
     main()
