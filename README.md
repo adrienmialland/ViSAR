@@ -105,7 +105,7 @@ If you use this code, please cite:
 
 ```text
 @article{Mialland2026ViSAR,
-  title={ViSAR: Training-Free Adaptive-$ k $ Retrieval for Visual Document Question Answering},
+  title={ViSAR: Training-Free Adaptive-$ k $ Retrieval for Document Visual Question Answering},
   author={Mialland, Adrien and Plantevit, Marc and Gallois, Julien and Robardet, C{\'e}line},
   journal={arXiv preprint arXiv:2609.02486},
   year={2026}
