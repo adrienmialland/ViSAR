@@ -54,9 +54,9 @@ class ImageRetriever():
             
             embed_query = self.encoder.encode_query(sample['question'])
             embed_pages = self.encoder.load_embed_pages(sample['doc_id'], dataset.embedding_dir)
-            
+
             ranking = ViSAR.score_pages_and_find_k_star(
-                embed_query[0], embed_pages
+                embed_query[0], embed_pages, top_s=None
             )
 
             ranking['scores'] = [round(s, 3) for s in ranking['scores']]
@@ -88,22 +88,31 @@ class ImageRetriever():
             embed_query = self.encoder.encode_query(sample['question'])
             embed_pages = self.encoder.load_embed_pages(sample['doc_id'], dataset.embedding_dir)
 
-            ranking = self.late_interaction_scores(
-                embed_query, embed_pages
-            )
+            ranking = self.late_interaction_scores(embed_query, embed_pages)
 
             sample.setdefault(self.mode, {}).update({
                 self.encoder.name: {
                     "indexes": ranking["indexes"],
                     "scores": ranking["scores"],
-                    "timings": ranking["timings"]
+                    "latency": ranking["latency"]
                 }
             })
 
-            if self.mode == "LargestGap":
-                sample[self.mode][self.encoder.name]['k_star'] = heurstics.LargestGap(ranking["scores"])
-            elif self.mode == 'ScoreCluster':
-                sample[self.mode][self.encoder.name]['k_star'] = heurstics.ScoreCluster(ranking["scores"])
+            if self.mode in ['LargestGap', 'ScoreCluster']:
+                if len(ranking["indexes"]) == 0:
+                    k_star = 0
+                else:
+                    if self.mode == "LargestGap":
+                        start = time.perf_counter()
+                        k_star = heurstics.LargestGap(ranking["scores"])
+                    elif self.mode == 'ScoreCluster':
+                        start = time.perf_counter()
+                        k_star = heurstics.ScoreCluster(ranking["scores"])
+                    
+                    latency = time.perf_counter() - start
+                    sample[self.mode][self.encoder.name]['latency']['total'] += latency
+
+                sample[self.mode][self.encoder.name]['k_star'] = k_star
 
             dataset.new_data = True
             dataset.save_results(data, 30)
@@ -114,18 +123,18 @@ class ImageRetriever():
     def late_interaction_scores(self, embed_query: torch.Tensor, embed_pages: torch.Tensor):
         if not all(e.isfinite().all() for e in embed_pages):
             print('Warning: page embeddings contains NaN of Inf values. Skipping this query.')
-            return {"indexes": [], "scores" : [], 'timings': {}}
+            return {"indexes": [], "scores" : [], 'latency': {}}
         
         start  = time.perf_counter()
         scores = self.encoder.compute_scores(embed_pages, embed_query)
-        timing = time.perf_counter() - start
+        latency = time.perf_counter() - start
 
         s_sorted = torch.tensor(scores).sort(descending=True)
         
         return {
             "indexes": s_sorted.indices.tolist(),
             "scores": [round(s, 3) for s in s_sorted.values.tolist()],
-            "timings": {'total': timing}
+            "latency": {'total': latency}
         }
 
 class HeuristicsSelector():
@@ -240,7 +249,7 @@ class ViSARSelector():
             block_size=block_size,
             weight_thr=weight_thr,
             top_j=top_j,
-            top_p=top_p,
+            top_s=top_s,
         )
         t2 = time.perf_counter()
 
@@ -274,29 +283,29 @@ class ViSARSelector():
             MaxSim.append(Sim[-1].amax(dim=1))    # Equation 2, [m]     (num q_i,)
         A_pi = torch.stack(MaxSim)                # Equation 2, [N, m]  (num pages, num q_i)
 
-        # Equation 3, 4, and
+        # Equation 3, 4, 5, and 6
         # highlight strong and spatially localized semantics
         A_i_std = A_pi.std(dim=0)                          # Equation 3 
-        sigma_i = A_i_std / A_i_std.mean()                 # Equation 3 
-        A_pi_hat = (A_pi / A_pi.mean(dim=0, keepdim=True)) # Equation 3 
-        A_pi_tilde = A_pi_hat * sigma_i                    # Equation 4
+        sigma_i = A_i_std / A_i_std.mean()                 # Equation 4
+        A_pi_hat = (A_pi / A_pi.mean(dim=0, keepdim=True)) # Equation 3
+        A_pi_tilde = A_pi_hat * sigma_i                    # Equation 5
         # get token-level weights w_i
-        a_pi = A_pi_tilde.sum(dim=0)             # Equation 5
-        w_i = torch.log(n_pages / (1.0 + a_pi))  # Equation 5
+        a_pi = A_pi_tilde.sum(dim=0)             # Equation 6
+        w_i = torch.log(n_pages / (1.0 + a_pi))  # Equation 6
 
-        # Equation 6 and 7
+        # Equation 7 and 8
         # Cmpute page-level semantic co-activation
-        A_i_bar = A_pi_tilde.mean(dim=0)                                   # Equation 6
-        C_pii = A_pi_tilde[:, :, None] * A_pi_tilde[:, None, :]            # Equation 6
-        C_pii_hat = (C_pii / (A_i_bar[:, None] * A_i_bar[None, :] + 1e-6)) # Equation 6
+        A_i_bar = A_pi_tilde.mean(dim=0)                                   # Equation 7
+        C_pii = A_pi_tilde[:, :, None] * A_pi_tilde[:, None, :]            # Equation 7
+        C_pii_hat = (C_pii / (A_i_bar[:, None] * A_i_bar[None, :] + 1e-6)) # Equation 7
         # get page-level weight w_p
-        w_p = C_pii_hat.to(torch.bfloat16).mean(dim=1).sum(dim=1) # Equation 7
+        w_p = C_pii_hat.to(torch.bfloat16).mean(dim=1).sum(dim=1) # Equation 8
 
-        # Equation 8
+        # Equation 9
         # min-max normalization of token-level and page-level weights
         w_i_hat = (w_i - w_i.min()) / (w_i.max() - w_i.min() + 1e-6)
         w_p_hat = (w_p - w_p.min()) / (w_p.max() - w_p.min())
-        A_weighted = A_pi_tilde * w_i_hat[None, :] * w_p_hat[:, None] # Equation 8 subcomponant: Ã_p,i weighted.
+        A_weighted = A_pi_tilde * w_i_hat[None, :] * w_p_hat[:, None] # Equation 9 subcomponant: Ã_p,i weighted.
         # get patche-level embeddings relevance score r_pj
         r_pj: list[torch.Tensor] = []
         for sim, A_w in zip(Sim, A_weighted):
@@ -304,11 +313,11 @@ class ViSARSelector():
                 (sim * A_w[:, None].pow(2)).amax(dim=0) # Equation 8
             )
 
-        # Equaion 9
+        # Equaion 10
         # get patche-level weights
         r_pj_flat = torch.cat(r_pj)  # flatten to compute a global mean
         r_pj_mean = r_pj_flat.mean() # mean patch relevance across pages
-        w_pj = (r_pj_flat - r_pj_mean).clamp(min=0) # Equation 9
+        w_pj = (r_pj_flat - r_pj_mean).clamp(min=0) # Equation 10
 
         n_v_jp = [len(r_j) for r_j in r_pj] # reshape relevances r_pj back to [N, np] (num pages, num v_pj)
         mm, mx = w_pj.min(), w_pj.max()
@@ -329,8 +338,14 @@ class ViSARSelector():
         same_size_i = all(w.numel() == len(pw_block_i[0]) for w in pw_block_i)
         same_size_j = all(w.numel() == len(pw_block_j[0]) for w in pw_block_j)
         return same_size_i and same_size_j
+ 
+    def self_similarity(self, embed, weight, top_T):
+        # Sim(p, p) before the square root: same formula as Equations 11-12 with p' = p
+        patch_sims = embed @ embed.T                                       # [N_p, N_p]
+        s = (patch_sims * weight[None, :]).amax(dim=1) * weight
+        return s.topk(min(top_T, s.size(0))).values.mean()
 
-    def compute_sim_mat(self, embed_pages: list[torch.Tensor], patch_weights: list[torch.Tensor], top_T: int, block_size: int, weight_thr: float, top_j: int | None, top_p: int | None):
+    def compute_sim_mat(self, embed_pages: list[torch.Tensor], patch_weights: list[torch.Tensor], top_T: int, block_size: int, weight_thr: float, top_j: int | None, top_s: int | None):  # CHANGED: top_p -> top_s
         n_pages = len(embed_pages)
         device  = embed_pages[0].device
 
@@ -339,31 +354,37 @@ class ViSARSelector():
         active_mask = torch.tensor([w.max().item() > weight_thr for w in patch_weights], dtype=torch.bool, device=device)
         active_idx  = active_mask.nonzero(as_tuple=True)[0].tolist()
 
-        # If top_p is not None, apply ViSAR-Approx to further reduce the number of pages to the most promising ones.
-        # ViSAR-Approx is an accelerated version of ViSAR for very long document, which approximates the similarity matrix
-        # and is presented in supplemental material, subsection "Acceleration Strategies for Very Long Documents".
-        if top_p is not None and len(active_idx) > top_p:
-            active_idx = sorted(active_idx, key=lambda i: patch_weights[i].max().item(), reverse=True)[:top_p]
-            active_idx = sorted(active_idx)  # restore original page order for sim mat indexing
-
         active_embeds  = [embed_pages[i]    for i in active_idx]
         active_weights = [patch_weights[i]  for i in active_idx]
 
-        # If top_j is not None, apply ViSAR-Approx to further reduce the number of pages to the most promising ones.
+        # If top_p is not None, apply ViSAR-Approx to further reduce the number of pages to the most promising ones.
         # ViSAR-Approx is an accelerated version of ViSAR for very long document, which approximates the similarity matrix
-        # and is described in the supplemental material, subsection "Acceleration Strategies for Very Long Documents".
+        # and is presented in supplemental material, subsection "Acceleration Strategies for Very Long Documents".
         if top_j is not None:
             active_embeds, active_weights = self.filter_patches(active_embeds, active_weights, top_j)
 
-        # Only compute similarities for the selected pages: reduced [n_active x n_active] similarity matrix.
-        n_active    = len(active_idx)
-        reduced_sim = torch.zeros((n_active, n_active), device=device)
+        n_active = len(active_idx)
+
+        # rows are restricted to the top_s pages with the highest self-similarity.
+        # Columns remain all active pages, since the leakage term averages over every page outside R_k.
+        restrict_rows = top_s is not None and n_active > top_s
+        if restrict_rows:
+            diag    = torch.stack([self.self_similarity(e, w, top_T) for e, w in zip(active_embeds, active_weights)])  # [n_active]
+            src_pos = diag.topk(top_s).indices.sort().values                     # positions in the active list
+            src_embeds  = [active_embeds[i]  for i in src_pos.tolist()]
+            src_weights = [active_weights[i] for i in src_pos.tolist()]
+        else:
+            src_embeds, src_weights = active_embeds, active_weights
+
+        # Only compute similarities for the selected pages: [n_src x n_active] similarity matrix.
+        reduced_sim = torch.zeros((len(src_embeds), n_active), device=device)
 
         # compute the (reduced) similarity matrix
         # generate_blocks allows to evaluate patch embedding similarity block-wise, to avoid peak memory usage.
         # This is strictly equivalent than using a dense tensor to compute all similarities at once.
-        for i_start, i_end, block_i, pw_block_i in self.generate_blocks(active_embeds, active_weights, block_size, start_from=0):
-            for j_start, j_end, block_j, pw_block_j in self.generate_blocks(active_embeds, active_weights, block_size, start_from=i_start):
+        for i_start, i_end, block_i, pw_block_i in self.generate_blocks(src_embeds, src_weights, block_size, start_from=0):
+            j_first = 0 if restrict_rows else i_start                                # upper triangle only when the full matrix is computed
+            for j_start, j_end, block_j, pw_block_j in self.generate_blocks(active_embeds, active_weights, block_size, start_from=j_first):
                 b1, b2 = i_end - i_start, j_end - j_start
                 sim_i_block = torch.zeros((b1, b2), device=device)
                 sim_j_block = torch.zeros_like(sim_i_block)
@@ -376,45 +397,46 @@ class ViSARSelector():
                     pw_i = torch.stack(pw_block_i) # [b1, N_p]
                     pw_j = torch.stack(pw_block_j) # [b2, N_p]
 
-                    # Dot-product in Equation 10
-                    patch_sims = torch.einsum("pnd,qmd->pqnm", bl_i, bl_j)   # (b1, b2, n_patches, n_patches)
+                    # Dot-product in Equation 11
+                    patch_sims = torch.einsum("pnd,qmd->pqnm", bl_i, bl_j) # (b1, b2, n_patches, n_patches)
 
-                    # Equation 10: 
-                    # both direction p->p' and p'->p are computed simultaneously.
+                    # Equation 11 and 12 (without the square root): 
                     # The similarity is directional, since each source patch independently searches for its best match in the target page.
-                    sim_i_to_j = (patch_sims * pw_j[None, :, None, :]).amax(dim=3) * pw_i[:, None, :]
-                    sim_j_to_i = (patch_sims * pw_i[:, None, :, None]).amax(dim=2) * pw_j[None, :, :]
-
-                    # Equation 11 (without the square root)
-                    sim_i_block = sim_i_to_j.topk(min(top_T, sim_i_to_j.size(2)), dim=2).values.mean(dim=2)
-                    sim_j_block = sim_j_to_i.topk(min(top_T, sim_j_to_i.size(2)), dim=2).values.mean(dim=2)
-
+                    sim_i_to_j = (patch_sims * pw_j[None, :, None, :]).amax(dim=3) * pw_i[:, None, :]           # Equation 11
+                    sim_i_block = sim_i_to_j.topk(min(top_T, sim_i_to_j.size(2)), dim=2).values.mean(dim=2)     # Equation 12 (without the square root)
+                    if not restrict_rows: # compute reverse direction only when the full matrix is computed
+                        sim_j_to_i = (patch_sims * pw_i[:, None, :, None]).amax(dim=2) * pw_j[None, :, :]       # Equation 11
+                        sim_j_block = sim_j_to_i.topk(min(top_T, sim_j_to_i.size(2)), dim=2).values.mean(dim=2) # Equation 12 (without the square root)
+                
                 # compute block similarities from heterogenuous blocks
                 # e.g ColQwen encoder can yield a varying number of embeddings per page.
                 else:
                     for bi, pi, wi in zip(range(b1), block_i, pw_block_i):
                         for bj, pj, wj in zip(range(b2), block_j, pw_block_j):
-                            patch_sims = pi @ pj.T                            # [N_pi, N_pj]
-                            # Equation 10: 
-                            # both direction p->p' and p'->p are computed simultaneously.
+                            patch_sims = pi @ pj.T               # [N_pi, N_pj]
+                            # Equation 11 and 12 (without the square root): 
                             # The similarity is directional, since each source patch independently searches for its best match in the target page.
-                            sim_i_to_j = (patch_sims * wj[None, :]).amax(dim=1) * wi
-                            sim_j_to_i = (patch_sims * wi[:, None]).amax(dim=0) * wj
-
-                            # Equation 11 (without the square root)
-                            sim_i_block[bi, bj] = sim_i_to_j.topk(min(top_T, sim_i_to_j.size(0))).values.mean()
-                            sim_j_block[bi, bj] = sim_j_to_i.topk(min(top_T, sim_j_to_i.size(0))).values.mean()                            
+                            sim_i_to_j = (patch_sims * wj[None, :]).amax(dim=1) * wi                            # Equation 11
+                            sim_i_block[bi, bj] = sim_i_to_j.topk(min(top_T, sim_i_to_j.size(0))).values.mean() # Equation 12 (without the square root)
+                            if not restrict_rows:
+                                sim_j_to_i = (patch_sims * wi[:, None]).amax(dim=0) * wj                            # Equation 11
+                                sim_j_block[bi, bj] = sim_j_to_i.topk(min(top_T, sim_j_to_i.size(0))).values.mean() # Equation 12 (without the square root)
 
                 reduced_sim[i_start:i_end, j_start:j_end] = sim_i_block
-                if i_start != j_start:
+                if not restrict_rows and i_start != j_start: # condition to set reverse direction of the siilarity matrix.
                     reduced_sim[j_start:j_end, i_start:i_end] = sim_j_block.T
 
         # Scatter back the reduced matrix into the full [n_pages x n_pages] matrix.
         similarity_matrix = torch.zeros((n_pages, n_pages), device=device)
         idx = torch.tensor(active_idx, device=device)
-        similarity_matrix[idx[:, None], idx[None, :]] = reduced_sim        
+        if restrict_rows:
+            src_idx = idx[src_pos]
+            similarity_matrix[src_idx[:, None], idx[None, :]] = reduced_sim
+            similarity_matrix[idx, idx] = diag.float()
+        else:
+            similarity_matrix[idx[:, None], idx[None, :]] = reduced_sim
 
-        # Equation 11 square root
+        # Equation 12 square root
         similarity_matrix = similarity_matrix.sqrt()
         mn = similarity_matrix.min()
         mx = similarity_matrix.max()
@@ -430,9 +452,9 @@ class ViSARSelector():
                 filtered_embeds.append(emb)
                 filtered_weights.append(w)
             else:
-                topn_idx = w.topk(top_j).indices          # [top_j]
-                filtered_embeds.append(emb[topn_idx])     # [top_j, D]
-                filtered_weights.append(w[topn_idx])      # [top_j]
+                topj_idx = w.topk(top_j).indices          # [top_j]
+                filtered_embeds.append(emb[topj_idx])     # [top_j, D]
+                filtered_weights.append(w[topj_idx])      # [top_j]
 
         return filtered_embeds, filtered_weights    
 
@@ -461,17 +483,17 @@ class ViSARSelector():
             # ViSAR-Approx is an acceleration strategy of ViSAR for very long document presented 
             # in supplemental material, subsection "Acceleration Strategies for Very Long Documents".
             top_s = n_active if top_s is None else top_s
-            max_pages = min(n_active, top_s + 3, n_pages - 1)
+            max_k = min(n_active, top_s + 3, n_pages - 1)
 
-            for k in range(1, max_pages):
+            for k in range(1, max_k):
                 # Build relevant and irrelevant candidate sets.
                 R_k = ranked_p[:k]
                 I_k = [p for p in pages if p not in set(R_k)]
 
-                c_kp = similarity_matrix[R_k][:, R_k].mean(dim=1) # Equation 12
-                l_kp = similarity_matrix[R_k][:, I_k].mean(dim=1) # Equation 13
+                c_kp = similarity_matrix[R_k][:, R_k].mean(dim=1) # Equation 13
+                l_kp = similarity_matrix[R_k][:, I_k].mean(dim=1) # Equation 14
 
-                # Equation 14
+                # Equation 15
                 J_k.append(
                     (w_sp[R_k] * (c_kp - gamma * l_kp)).sum().item()
                 )
@@ -490,6 +512,7 @@ class ViSARSelector():
                 v_p = np.mean([abs(J_k[arg + i] - J_k[arg + i + 1]) for i in range(0, offset)])
                 arg = arg + int(v_p - v_m > epsilon)
 
+            # Equation 16
             k_star = min(int(arg + 1), top_s)
 
         return {
