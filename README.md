@@ -1,6 +1,6 @@
 # ViSAR
 
-This repository contains the code used for the paper [ViSAR: Training-Free Adaptive-k Retrieval for Visual Document Question Answering](https://arxiv.org/abs/2609.02486)
+This repository contains the code used for the paper [ViSAR: Training-Free Adaptive-k Retrieval for Document Visual Question Answering](https://arxiv.org/abs/2609.02486)
 
 ## Abstract
 
